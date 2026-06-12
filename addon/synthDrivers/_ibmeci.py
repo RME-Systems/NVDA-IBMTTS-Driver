@@ -8,25 +8,35 @@ from io import BytesIO
 from os import path
 import queue
 
+
 import threading, time
 import languageHandler, nvwave, addonHandler
-from synthDriverHandler import findAndSetNextSynth
 import queueHandler
 from config import conf
 from logHandler import log
 from fileUtils import getFileVersionInfo
 from ._settingsDB import appConfig
-
-addonHandler.initTranslation()
+try:
+	from synthDriverHandler import findAndSetNextSynth
+except ImportError:
+	log.info("Couldn't import findAndSetNextSynth from synthDriverHandler. So the IBMTTS engine won't be able to switch to another synth if it fails.", exc_info=True)
+	findAndSetNextSynth = lambda x: None
 
 
 # determine if 32 or 64 bits.
 import struct
 IS_64BIT = struct.calcsize("P") == 8
-from ._proxyEci import EciDLL
-from ._ipc import terminate_host_32
+if IS_64BIT:
+	from ._proxyEci import EciDLL
+	from ._ipc import terminate_host_32, is_host_process_alive
+else:
+	is_host_process_alive = lambda: True
 
-class  ECIParam:
+
+addonHandler.initTranslation()
+
+
+class  ECIParam():
 	eciSynthMode=0
 	eciInputType=1
 	eciTextMode=2
@@ -44,19 +54,19 @@ class ECIVoiceParam:
 	eciGender, eciHeadSize, eciPitchBaseline, eciPitchFluctuation, eciRoughness, eciBreathiness, eciSpeed, eciVolume = range(8)
 
 
-class ECIDictVolume:
+class ECIDictVolume():
 	eciMainDict, eciRootDict, eciAbbvDict, eciMainDictExt = range(4)
 
 
-class ECIMessage:
+class ECIMessage():
 	eciWaveformBuffer, eciPhonemeBuffer, eciIndexReply, eciPhonemeIndexReply, eciWordIndexReply = range(5)
 
 
-class ECICallbackReturn:
+class ECICallbackReturn():
 	eciDataNotProcessed, eciDataProcessed, eciDataAbort= range(3)
 
 
-class ECILanguageDialect:
+class ECILanguageDialect():
 	NODEFINEDCODESET = 0x00000000
 	GeneralAmericanEnglish = 0x00010000
 	BritishEnglish = 0x00010001
@@ -166,6 +176,17 @@ dictHandles={}
 params = {}
 vparams = {}
 
+def check_lang_param(lang):
+	if lang in avLangs:
+		return lang
+	log.warning("Language %s is not supported by the IBMTTS engine. Changing to a default language" % lang)
+	lang = getVoiceByLanguage(languageHandler.getLanguage())[0]
+	if lang in avLangs:
+		return lang
+	log.warning("Couldn't find a default language for the IBMTTS engine. Changing to the first available language.")
+	return avLangs[0]
+
+
 def post_message_to_eciThread(msg, wParam, lParam, exceptOnDie=True):
 	"""Send a message to the ECI thread. First verifying that it is alive."""
 	global eciThread
@@ -185,7 +206,7 @@ class EciThread(threading.Thread):
 			started.set()
 			stopped.set()
 			param_event.set()
-			if dll:
+			if dll and is_host_process_alive():
 				dll.eciDelete(handle)
 
 	def _run(self):
@@ -277,11 +298,18 @@ def setPathsFromConfig():
 
 def updateIniPaths():
 	iniPath = path.join(ttsPath, dllName[:-3] +"ini")
-	if path.isabs(appConfig.TTSPath) or not path.exists(iniPath):
+	if not path.exists(iniPath):
+		# some libs don't have an ini file, so we just
 		return
 	ini=open(iniPath, "r+")
 	ini.seek(12)
-	tml=ini.readline()[:-8]
+	synFile = ini.readline()[:-1]
+	if path.exists(synFile):
+		# the path is correct, so we don't need to change it.
+		ini.close()
+		return
+	log.warning("The path in the IBMTTS ini file is incorrect. Updating it to the correct path. This may fail if NVDA doesn't have permission to write to the ini file, in which case the IBMTTS synth may not work.")
+	tml = synFile[:-7]
 	newPath = ttsPath + "\\"
 	if tml != newPath:
 		ini.seek(12)
@@ -338,10 +366,12 @@ def eciNew():
 		eci.eciGetAvailableLanguages(0,byref(b))
 		avLangs=(c_int*b.value)()
 		eci.eciGetAvailableLanguages(byref(avLangs),byref(b))
-	try:
-		handle=eci.eciNewEx(int(conf['speech']['ibmeci']['voice']))
-	except:
-		handle=eci.eciNewEx(getVoiceByLanguage(languageHandler.getLanguage())[0])
+	if conf.get('speech', {}).get('ibmeci', {}).get('voice'):
+		lang = int(conf['speech']['ibmeci']['voice'])
+	else:
+		lang = getVoiceByLanguage(languageHandler.getLanguage())[0]
+	lang = check_lang_param(lang)
+	handle = eci.eciNewEx(lang)
 	for i in ECIVoiceParam.params:
 		vparams[i] = eci.eciGetVoiceParam(handle, 0, i)
 	return eci,handle
@@ -505,6 +535,7 @@ def terminate():
 
 
 def setVoice(vl):
+	vl = check_lang_param(vl)
 	post_message_to_eciThread(WM_PARAM, vl, ECIParam.eciLanguageDialect)
 	param_event.wait()
 	param_event.clear()
